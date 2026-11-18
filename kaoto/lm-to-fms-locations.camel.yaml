@@ -1,0 +1,258 @@
+# LM -> FMS locations, Apache Camel YAML DSL (open in Kaoto for the visual designer).
+# Port of Fabric 9_pl_LM_To_FMS_Locations; step ids reuse the Fabric activity names.
+- beans:
+    - name: lmFms
+      type: "#class:LmFmsLocations"
+    - name: lmDataSource
+      type: com.microsoft.sqlserver.jdbc.SQLServerDataSource
+      properties:
+        serverName: "{{lm.db.host}}"
+        portNumber: "{{lm.db.port}}"
+        databaseName: "{{lm.db.name}}"
+        user: "{{lm.db.user}}"
+        password: "{{lm.db.password}}"
+        encrypt: "true"
+        trustServerCertificate: "{{lm.db.trustServerCertificate}}"
+    - name: fmsDataSource
+      type: com.ibm.as400.access.AS400JDBCDataSource
+      properties:
+        serverName: "{{fms.db.host}}"
+        user: "{{fms.db.user}}"
+        password: "{{fms.db.password}}"
+        naming: system
+        prompt: "false"
+    - name: fmsPool
+      type: java.util.concurrent.Executors
+      factoryMethod: newFixedThreadPool
+      constructors:
+        "0": "{{fms.parallelism}}"
+
+# Retries, as Fabric's activity policy: 5 retries, 30 s apart, for the step that failed
+# (LM lookups, file reads/writes, run log). The FMS calls are inside doTry, so they are
+# never retried (Fabric: CallFmsLocation retry 0).
+- onException:
+    id: RetryTransientFailure
+    exception:
+      - java.lang.Exception
+    redeliveryPolicy:
+      maximumRedeliveries: 5
+      redeliveryDelay: "{{lm.retryDelayMs:30000}}"
+      retryAttemptedLogLevel: WARN
+    handled:
+      constant: "false"
+    steps:
+      - to:
+          uri: "direct:sendUpstreamFailureEmail"
+
+# Deliberate stops (FailOn* gates, held watermark) and mail errors: no retry, they would
+# fail the same way again (Fabric: Fail activities, SendDigestEmail retry 0).
+- onException:
+    id: NoRetryFailure
+    exception:
+      - java.lang.IllegalStateException
+      - java.lang.IllegalArgumentException
+      - jakarta.mail.MessagingException
+    redeliveryPolicy:
+      maximumRedeliveries: 0
+    handled:
+      constant: "false"
+    steps:
+      - to:
+          uri: "direct:sendUpstreamFailureEmail"
+
+# InvokeLogging: runs on success and failure alike.
+- onCompletion:
+    id: InvokeLogging
+    mode: AfterConsumer
+    steps:
+      - bean:
+          id: BuildRunLog
+          ref: lmFms
+          method: runLog
+      - setHeader:
+          name: CamelFileName
+          simple: "runlog/${exchangeProperty.runId}.json"
+      - to:
+          id: WriteRunLog
+          uri: "file:{{lm.staging.dir}}"
+
+# SendUpstreamFailureEmail + FailRunOnUpstreamError: mail, then let the exchange fail (handled=false).
+- route:
+    id: SendUpstreamFailureEmail
+    from:
+      uri: "direct:sendUpstreamFailureEmail"
+      steps:
+        - bean:
+            id: BuildFailureMail
+            ref: lmFms
+            method: failureMail
+        - setHeader:
+            name: subject
+            simple: "ERROR: Camel: lm-to-fms-locations FAILED (watermark held) - run ${exchangeProperty.runId}"
+        # a mail outage must not mask the original failure in the run log
+        - doTry:
+            steps:
+              - to:
+                  id: MailFailure
+                  uri: "smtp://{{mail.host}}:{{mail.port}}"
+                  parameters:
+                    username: "{{mail.username}}"
+                    password: "RAW({{mail.password}})"
+                    from: "{{mail.from}}"
+                    to: "{{mail.to}}"
+                    mail.smtp.starttls.enable: "true"
+            doCatch:
+              - exception:
+                  - java.lang.Exception
+                steps:
+                  - log:
+                      loggingLevel: WARN
+                      message: "Failure mail not sent: ${exception.message}"
+
+- route:
+    id: lm-to-fms-locations
+    description: Pushes LocationManagement location changes to FMS (DB2 compound statement per location).
+    from:
+      id: Schedule
+      uri: "quartz:lm2fms"
+      parameters:
+        cron: "{{lm.cron}}"
+        stateful: true
+      steps:
+        - setProperty:
+            name: runId
+            simple: "${uuid(random)}"
+
+        # --- ReadWatermark -------------------------------------------------
+        - bean:
+            id: ReadWatermark
+            ref: lmFms
+            method: readWindow
+        - choice:
+            id: CheckWatermarkError
+            when:
+              - simple: "${exchangeProperty.watermarkError} != ''"
+                steps:
+                  - throwException:
+                      id: FailOnWatermarkError
+                      exceptionType: java.lang.IllegalStateException
+                      message: "WATERMARK_UNUSABLE: ${exchangeProperty.watermarkError}. LocationManagement was NOT read."
+
+        # --- LookupLocationChanges (two result sets, each ends in a sentinel row) ---
+        - to:
+            id: LookupLocations
+            uri: "sql:classpath:sql/lm-locations.sql"
+            parameters:
+              dataSource: "#lmDataSource"
+              outputType: SelectList
+              template.queryTimeout: 1200
+        - setProperty:
+            name: lmLocations
+            simple: "${body}"
+        - to:
+            id: LookupRequirements
+            uri: "sql:classpath:sql/lm-requirements.sql"
+            parameters:
+              dataSource: "#lmDataSource"
+              outputType: SelectList
+              template.queryTimeout: 1200
+
+        # --- BuildLocationCalls --------------------------------------------
+        - bean:
+            id: BuildLocationCalls
+            ref: lmFms
+            method: buildCalls
+        - choice:
+            id: CheckBuildError
+            when:
+              - simple: "${exchangeProperty.buildError} != ''"
+                steps:
+                  - throwException:
+                      id: FailOnBuildError
+                      exceptionType: java.lang.IllegalStateException
+                      message: "BUILD_FAILED: ${exchangeProperty.buildError}. Nothing was sent."
+
+        # --- CallFmsLocations (parallel, one DB2 compound statement per location) ---
+        - split:
+            id: CallFmsLocations
+            expression:
+              simple: "${body}"
+            parallelProcessing: true
+            executorService: fmsPool
+            aggregationStrategy: "#class:org.apache.camel.processor.aggregate.GroupedBodyAggregationStrategy"
+            steps:
+              - setProperty:
+                  name: locationId
+                  simple: "${body[locationId]}"
+              - setProperty:
+                  name: requirementCount
+                  simple: "${body[requirementCount]}"
+              - doTry:
+                  id: CallFmsLocation
+                  steps:
+                    - setBody:
+                        simple: "${body[sql]}"
+                    - to:
+                        id: ExecuteDb2Block
+                        uri: "jdbc:fmsDataSource"
+                        parameters:
+                          statement.queryTimeout: 180
+                    - bean:
+                        id: RecordUnsignalledOutcome
+                        ref: lmFms
+                        method: outcome
+                  doCatch:
+                    - exception:
+                        - java.lang.Exception
+                      steps:
+                        - bean:
+                            id: RecordLocationOutcome
+                            ref: lmFms
+                            method: outcome
+
+        # --- FinalizeLocations ---------------------------------------------
+        - bean:
+            id: FinalizeLocations
+            ref: lmFms
+            method: finalizeLocations
+        - setHeader:
+            name: CamelFileName
+            simple: "items/${exchangeProperty.runId}/items.json"
+        - to:
+            id: WriteItemLog
+            uri: "file:{{lm.staging.dir}}"
+
+        # --- AdvanceWatermark (throws when a technical failure held it) ----
+        - bean:
+            id: AdvanceWatermark
+            ref: lmFms
+            method: advanceWatermark
+        - to:
+            id: WriteWatermark
+            uri: "file:{{lm.staging.dir}}"
+            parameters:
+              fileName: watermark.json
+              fileExist: Override
+
+        # --- CheckDigestEmail ----------------------------------------------
+        - choice:
+            id: CheckDigestEmail
+            when:
+              - simple: "${exchangeProperty.hasFailures} == true"
+                steps:
+                  - removeHeaders:
+                      pattern: "*"
+                  - setHeader:
+                      name: subject
+                      simple: "BUSINESS: Camel: lm-to-fms-locations - ${exchangeProperty.fmsErrors} location(s) refused by FMS - run ${exchangeProperty.runId}"
+                  - setBody:
+                      simple: "${exchangeProperty.digestBody}"
+                  - to:
+                      id: SendDigestEmail
+                      uri: "smtp://{{mail.host}}:{{mail.port}}"
+                      parameters:
+                        username: "{{mail.username}}"
+                        password: "RAW({{mail.password}})"
+                        from: "{{mail.from}}"
+                        to: "{{mail.to}}"
+                        mail.smtp.starttls.enable: "true"

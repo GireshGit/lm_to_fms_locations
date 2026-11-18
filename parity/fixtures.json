@@ -1,0 +1,29 @@
+{
+  "endTs": "2026-11-03 10:15:00.000",
+  "fmsLibrary": "FMSLIB",
+  "defaultPhone": "0000000001",
+  "maxLocations": 3,
+  "locations": [
+    {"LocationId": "1234", "LocationName": "O'Hare Yard \"North\"", "StreetAddress1": "100 Main St", "StreetAddress2": null,
+     "City": "Chicago", "State": " IL ", "Country": "US", "PostalCode": "60601-1234", "Phone": "312-555-0100",
+     "ContactName": "Dock\tLead", "Fax": "", "Status": "1", "LocationCategoryName": "TERMINAL",
+     "LocationCategoryDesc": "Rail terminal with a description longer than thirty characters", "ParentId": null,
+     "FacilityDropsite": "DS01", "FacilityLocaleKey": "LOC123456789", "ChangedTs": "2026-11-03 10:01:02.003"},
+    {"LocationId": "77", "LocationName": "Zero Phone", "StreetAddress1": "", "StreetAddress2": "Suite 5", "City": "Dallas",
+     "State": "TX", "Country": "CAN", "PostalCode": "", "Phone": "000-000", "ContactName": null, "Fax": "214 555 0199",
+     "Status": "0", "LocationCategoryName": "SHIPPER", "LocationCategoryDesc": "", "ParentId": "1234",
+     "FacilityDropsite": "", "FacilityLocaleKey": null, "ChangedTs": "2026-11-03 10:05:00.000"},
+    {"LocationId": "123456789", "LocationName": "Too Long Id", "ChangedTs": "2026-11-03 10:05:00.000"},
+    {"LocationId": "-1", "ChangedTs": "2026-11-03 10:15:03.250"}
+  ],
+  "requirements": [
+    {"LocationId": "1234", "ReqType": "O", "ReqText": "Gate code:4471", "ReqSeq": "1"},
+    {"LocationId": "1234", "ReqType": "D", "ReqText": "Appointment:Call ahead 24h", "ReqSeq": "2"},
+    {"LocationId": "1234", "ReqType": "XX", "ReqText": "Weird type", "ReqSeq": "3"},
+    {"LocationId": "-1", "ReqType": "", "ReqText": "", "ReqSeq": ""}
+  ],
+  "watermarks": ["", "{\"nextBeginTs\": \"2026-11-03 10:00:00.000\", \"nextBeginId\": 55}", "{bad", "[]",
+                 "{\"nextBeginTs\": \"2026-11-03 11:00:00.000\"}", "{\"nextBeginTs\": \"2026-11-03 10:00:00.000\", \"nextBeginId\": \"x\"}"],
+  "messages": ["[SQL0438] P9OK", "P9ERR AU DLS0313 Phone number invalid", "[SQL0438] P9OK P9ERR RA X1   text",
+               "Communication link failure", ""]
+}

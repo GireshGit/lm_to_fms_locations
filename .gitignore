@@ -1,0 +1,5 @@
+kaoto/data/
+kaoto/.camel-jbang/
+nifi/drivers/*.jar
+__pycache__/
+.DS_Store
